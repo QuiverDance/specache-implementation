@@ -1,0 +1,32 @@
+# .gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-selfcheck.json
+
+# Conda
+.conda/
+conda-meta/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data & Models (대용량 파일)
+/data/
+/models/
+*.bin
+*.pt
+*.safetensors
+
+# Log & Output files
+*.log
+*.out
