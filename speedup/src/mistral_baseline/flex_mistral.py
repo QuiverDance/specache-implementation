@@ -152,7 +152,7 @@ class InputEmbed:
                 cache_write_buf, i, k):
         # Simplified forward pass for input embedding without pos_embed
         donate = [False] * 2
-        h, donate[0] = hidden.val, True
+        h, donate[0] = hidden.val, False
         if k == self.policy.num_gpu_batches - 1:
             (w_token, donate[1]), = weight_read_buf.pop()
         else:
@@ -208,7 +208,7 @@ class OutputEmbed:
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
         donate = [False] * 3
-        h, donate[0] = hidden.val, True
+        h, donate[0] = hidden.val, False
         if k == self.policy.num_gpu_batches - 1:
             (w_ln, donate[1]), (w_lm_head, donate[2]) = weight_read_buf.pop()
         else:
@@ -375,7 +375,7 @@ class SelfAttention:
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             donate_gen = [False] * 2
-            h, donate_gen[0] = hidden.val, True
+            h, donate_gen[0] = hidden.val, False
             
             # Unpack all weights from the tuple
             (w_ln, donate_ln), (w_q, _), (w_k, _), \

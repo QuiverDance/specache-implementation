@@ -391,11 +391,7 @@ class TorchDevice:
         head_dim = h // config.n_head
         
         # 1. RMS Normalization
-        # Use the correct indices for the `donate` list.
-        # `donate` list for mha_gen will have size 2: [donate_inputs, donate_w_ln]
         hidden = self.rmsnorm(inputs.data, w_ln.data)
-        if donate[0]: inputs.delete()
-        if donate[1]: w_ln.delete()
 
         # 2. Q, K, V Projection
         q = F.linear(hidden, w_q.data)
