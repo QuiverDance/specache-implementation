@@ -152,7 +152,7 @@ class InputEmbed:
                 cache_write_buf, i, k):
         # Simplified forward pass for input embedding without pos_embed
         donate = [False] * 2
-        h, donate[0] = hidden.val, True
+        h, donate[0] = hidden.val, False
         if k == self.policy.num_gpu_batches - 1:
             (w_token, donate[1]), = weight_read_buf.pop()
         else:
@@ -208,7 +208,7 @@ class OutputEmbed:
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
         donate = [False] * 3
-        h, donate[0] = hidden.val, True
+        h, donate[0] = hidden.val, False
         if k == self.policy.num_gpu_batches - 1:
             (w_ln, donate[1]), (w_lm_head, donate[2]) = weight_read_buf.pop()
         else:
@@ -375,7 +375,7 @@ class SelfAttention:
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             donate_gen = [False] * 2
-            h, donate_gen[0] = hidden.val, True
+            h, donate_gen[0] = hidden.val, False
             
             # Unpack all weights from the tuple
             (w_ln, donate_ln), (w_q, _), (w_k, _), \
@@ -798,7 +798,9 @@ def run_flexgen(args):
     prompt_len, gen_len = args.prompt_len, args.gen_len
     warmup_inputs = get_inputs(256, num_prompts, tokenizer, args.warmup_input_path)
     inputs = get_inputs(prompt_len, num_prompts, tokenizer, args.test_input_path)
-    gpu = TorchDevice("cuda:0")
+    
+    mistral_config = get_mistral_config(args.model)
+    gpu = TorchDevice("cuda:0", config=mistral_config)
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -808,7 +810,6 @@ def run_flexgen(args):
                     args.compress_weight, CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
                     args.compress_cache, CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False))
     
-    mistral_config = get_mistral_config(args.model)
     model = MistralLM(mistral_config, env, args.path, policy, model_id=args.model)
     print('------ Model Load Complete ------')
 

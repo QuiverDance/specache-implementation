@@ -227,7 +227,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 class TorchDevice:
     """Wrap tensor and computation APIs of a single CPU or GPU."""
 
-    def __init__(self, name, mem_capacity=None, flops=None):
+    def __init__(self, name, mem_capacity=None, flops=None, config=None):
         self.name = name
         self.mem_capacity = mem_capacity
         self.flops = flops
@@ -242,8 +242,9 @@ class TorchDevice:
         self.workspace_pt = 0
 
         # init for RoPE cache
-        if self.device_type == DeviceType.CUDA:
-            self.rotary_emb = MistralRotaryEmbedding(dim=128, max_position_embeddings=32768, base=10000, device=self.dev)
+        if self.device_type == DeviceType.CUDA and config:
+            head_dim = config.hidden_size // config.n_head
+            self.rotary_emb = MistralRotaryEmbedding(dim=head_dim, max_position_embeddings=config.max_seq_len, base=10000, device=self.dev)
             self.rmsnorm = RMSNorm(hidden_size=4096) # Temporary, actual weight is received from outside
 
     # Input Embedding (Simplifed)
@@ -390,11 +391,7 @@ class TorchDevice:
         head_dim = h // config.n_head
         
         # 1. RMS Normalization
-        # Use the correct indices for the `donate` list.
-        # `donate` list for mha_gen will have size 2: [donate_inputs, donate_w_ln]
         hidden = self.rmsnorm(inputs.data, w_ln.data)
-        if donate[0]: inputs.delete()
-        if donate[1]: w_ln.delete()
 
         # 2. Q, K, V Projection
         q = F.linear(hidden, w_q.data)
