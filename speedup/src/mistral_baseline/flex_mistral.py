@@ -798,7 +798,9 @@ def run_flexgen(args):
     prompt_len, gen_len = args.prompt_len, args.gen_len
     warmup_inputs = get_inputs(256, num_prompts, tokenizer, args.warmup_input_path)
     inputs = get_inputs(prompt_len, num_prompts, tokenizer, args.test_input_path)
-    gpu = TorchDevice("cuda:0")
+    
+    mistral_config = get_mistral_config(args.model)
+    gpu = TorchDevice("cuda:0", config=mistral_config)
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -808,7 +810,6 @@ def run_flexgen(args):
                     args.compress_weight, CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
                     args.compress_cache, CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False))
     
-    mistral_config = get_mistral_config(args.model)
     model = MistralLM(mistral_config, env, args.path, policy, model_id=args.model)
     print('------ Model Load Complete ------')
 
