@@ -6,4 +6,4 @@ sentencepiece==0.2.0
 protobuf==4.25.3
 attrs
 safetensors
-datasets
+datasets==3.6.0
