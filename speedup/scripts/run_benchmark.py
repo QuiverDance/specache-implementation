@@ -185,7 +185,7 @@ def run_benchmark(config):
     metrics = task_handler['evaluator'](predictions, references)
 
     total_tokens = total_prompt_tokens + total_generated_tokens
-    overall_throughtput = total_tokens / total_duration_sec if total_duration_sec > 0 else 0
+    overall_throughput = total_tokens / total_duration_sec if total_duration_sec > 0 else 0
     generation_throughput = total_generated_tokens / total_duration_sec if total_duration_sec > 0 else 0
 
     metrics['total_duration_sec'] = round(total_duration_sec, 2)
