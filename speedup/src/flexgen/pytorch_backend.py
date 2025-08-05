@@ -241,31 +241,39 @@ class TorchDevice:
         self.attention_compute_workspace = None
         self.workspace_pt = 0
 
-        # init for RoPE cache
-        if self.device_type == DeviceType.CUDA and config:
-            head_dim = config.hidden_size // config.n_head
-            self.rotary_emb = MistralRotaryEmbedding(dim=head_dim, max_position_embeddings=config.max_seq_len, base=10000, device=self.dev)
-            self.rmsnorm = RMSNorm(hidden_size=4096) # Temporary, actual weight is received from outside
+        # init for RoPE cache:
+        if config:
+            head_dim = config.hidden_size // config.num_attention_heads
+            # The key is `device=self.dev`, which will be 'cpu' for the cpu_device instance
+            # and 'cuda:0' for the gpu_device instance.
+            self.rotary_emb = MistralRotaryEmbedding(
+                dim=head_dim, 
+                max_position_embeddings=config.max_position_embeddings, 
+                base=10000, 
+                device=self.dev
+            )
+            self.rmsnorm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+
+        if self.device_type == DeviceType.CPU:
+            global global_cpu_device
+            global_cpu_device = self
 
     # Input Embedding (Simplifed)
-    def mistral_input_embed(self, inputs, w_token, donate):
+    def mistral_input_embed(self, inputs, w_token):
         token_ids = inputs.data
-        if donate[0]: inputs.delete()
         
         data = F.embedding(token_ids, w_token.data)
         
-        if donate[1]: w_token.delete()
         return TorchTensor.create_from_torch(data, self)
 
     # Output Embedding
-    def mistral_output_embed(self, inputs, w_ln, w_lm_head, donate,
+    def mistral_output_embed(self, inputs, w_ln, w_lm_head,
                              do_sample, temperature, rms_norm_eps):
         if w_lm_head.device.device_type == DeviceType.COMPRESSED:
             w_lm_head = w_lm_head.device.decompress(w_lm_head)
 
         # RMSNorm
         hidden = self.rmsnorm(inputs.data, w_ln.data)
-        if donate[0]: inputs.delete()
 
         logits = F.linear(hidden, w_lm_head.data)
         last_token_logits = logits[:, -1, :]
@@ -276,8 +284,6 @@ class TorchDevice:
         else:
             ids = last_token_logits.argmax(dim=-1, keepdim=True)
         
-        if donate[1]: w_ln.delete()
-        if donate[2]: w_lm_head.delete()
         return TorchTensor.create_from_torch(ids, self)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
@@ -287,7 +293,7 @@ class TorchDevice:
         # Calculating cache shape considering GQA
         batch_size = policy.gpu_batch_size
         num_kv_heads = config.num_key_value_heads
-        head_dim = config.hidden_size // config.n_head
+        head_dim = config.hidden_size // config.num_attention_heads
         
         # Allocate cache only for the required length, not the maximum possible length.
         if task:
@@ -314,7 +320,7 @@ class TorchDevice:
         residual_connection = inputs.data
 
         b, s, h = inputs.shape
-        head_dim = h // config.n_head
+        head_dim = h // config.num_attention_heads
         
         # 1. RMS Normalization
         hidden = self.rmsnorm(inputs.data, w_ln.data)
@@ -325,12 +331,13 @@ class TorchDevice:
         v = F.linear(hidden, w_v.data)
         
         # 3. Reshape to heads
-        q = q.view(b, s, config.n_head, head_dim).transpose(1, 2)
+        q = q.view(b, s, config.num_attention_heads, head_dim).transpose(1, 2)
         k = k.view(b, s, config.num_key_value_heads, head_dim).transpose(1, 2)
         v = v.view(b, s, config.num_key_value_heads, head_dim).transpose(1, 2)
         
         # 4. Apply RoPE
-        position_ids = torch.arange(0, s, dtype=torch.long, device=self.dev).unsqueeze(0)
+        target_device = inputs.device.dev
+        position_ids = torch.arange(0, s, dtype=torch.long, device=target_device).unsqueeze(0)
         cos, sin = self.rotary_emb(v, seq_len=s)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
@@ -340,34 +347,23 @@ class TorchDevice:
         v_cache_to_return = TorchTensor.create_from_torch(v.clone(), self)
 
         # 6. Apply GQA by repeating K, V heads for attention calculation only
-        n_rep = config.n_head // config.num_key_value_heads
+        n_rep = config.num_attention_heads // config.num_key_value_heads
         k_for_attn = self.repeat_kv(k, n_rep)
         v_for_attn = self.repeat_kv(v, n_rep)
         
-        # 7. Attention Score Calculation
-        attn_weights = torch.matmul(q, k_for_attn.transpose(2, 3)) / np.sqrt(head_dim)
-        
-        # 8. Apply combined causal and padding attention mask.
-        if attention_mask is not None:
-            # attention_mask is [b, s], 1 for valid tokens, 0 for padding.
-            # We need to create a mask where invalid positions are `True`.
-            causal_mask = torch.triu(torch.ones(s, s, device=self.dev, dtype=torch.bool), diagonal=1)
-            # expanded_mask is `True` for positions to be masked out.
-            expanded_mask = ~attention_mask.data[:, None, None, :].bool() | causal_mask[None, None, :, :]
-            attn_weights = torch.where(expanded_mask, torch.finfo(attn_weights.dtype).min, attn_weights)
+        # 7. Caluate Attention
+        causal_mask = torch.triu(torch.ones(s, s, device=target_device, dtype=torch.bool), diagonal=1)
+        inverted_padding_mask = (attention_mask.data == 0).view(b, 1, 1, s)
+        final_mask = inverted_padding_mask | causal_mask
 
-        # 9. Softmax and Attention Value
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        value = torch.matmul(attn_weights, v_for_attn)
-        
-        # 10. Output Projection and Residual Connection
+        value = torch.nn.functional.scaled_dot_product_attention(
+            q, k_for_attn, v_for_attn, attn_mask=final_mask
+        )
+
+        # 8. Output Projection and Residual Connection
         value = value.transpose(1, 2).contiguous().view(b, s, h)
         value = F.linear(value, w_out.data)
         value.add_(residual_connection)
-
-        # Free up memory
-        if donate[0]: inputs.delete()
-        if donate[2]: w_ln.delete()
         
         return TorchTensor.create_from_torch(value, self), k_cache_to_return, v_cache_to_return
 
@@ -388,7 +384,7 @@ class TorchDevice:
         residual_connection = inputs.data
 
         b, s, h = inputs.shape # s is 1
-        head_dim = h // config.n_head
+        head_dim = h // config.num_attention_heads
         
         # 1. RMS Normalization
         hidden = self.rmsnorm(inputs.data, w_ln.data)
@@ -399,7 +395,7 @@ class TorchDevice:
         v = F.linear(hidden, w_v.data)
         
         # 3. Reshape to heads
-        q = q.view(b, s, config.n_head, head_dim).transpose(1, 2)
+        q = q.view(b, s, config.num_attention_heads, head_dim).transpose(1, 2)
         k = k.view(b, s, config.num_key_value_heads, head_dim).transpose(1, 2)
         v = v.view(b, s, config.num_key_value_heads, head_dim).transpose(1, 2)
         
@@ -416,7 +412,7 @@ class TorchDevice:
         v_cache_updated = torch.cat([v_cache.data, v], dim=2)
         
         # 6. Apply GQA
-        n_rep = config.n_head // config.num_key_value_heads
+        n_rep = config.num_attention_heads // config.num_key_value_heads
         k_for_attn = self.repeat_kv(k_cache_updated, n_rep)
         v_for_attn = self.repeat_kv(v_cache_updated, n_rep)
         
@@ -571,7 +567,7 @@ class TorchDisk:
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         k_cache = self.allocate(shape, np.float16)
@@ -580,7 +576,7 @@ class TorchDisk:
 
     def submit_copy(self, *args):
         if self.copy_queue is None:
-            _copy_sync(*args)
+            self._copy_sync(*args)
         else:
             self.copy_queue.put_nowait(args)
 
@@ -608,7 +604,7 @@ class TorchDisk:
         if self.copy_queue:
             self.close_copy_threads()
 
-    def _copy_sync(dst, dst_indices, src, src_indices):
+    def _copy_sync(self, dst, dst_indices, src, src_indices):
         """A function that copies data synchronously."""
         src_data = map_to_torch_tensor(src, src_indices)
         dst_data = map_to_torch_tensor(dst, dst_indices)
@@ -661,7 +657,7 @@ class TorchMixedDevice:
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
 

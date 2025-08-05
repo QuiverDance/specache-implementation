@@ -43,6 +43,7 @@ fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"
 
+
 @dataclasses.dataclass(frozen=True)
 class Policy:
     gpu_batch_size: int
@@ -130,7 +131,7 @@ class InputEmbed:
         self.task = task
 
     def init_weight(self, weight_home, path):
-        v, h, dtype = (self.config.vocab_size, self.config.hidden_size, self.config.dtype)
+        v, h, dtype = (self.config.vocab_size, self.config.input_dim, self.config.dtype)
         path = os.path.join(path, "")
         weight_specs = [
             ((v, h), dtype, path + "model.embed_tokens.weight.npy"),
@@ -145,22 +146,21 @@ class InputEmbed:
         w_token = weight_home.val[0]
         if k == 0:
             dst = self.weight_load_dst
-            weight_read_buf.store((w_token.smart_copy(dst)[0],
-            ))
+            weight_read_buf.store((w_token.smart_copy(dst),))
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
         # Simplified forward pass for input embedding without pos_embed
-        h = hidden.val
-        
+        donate = [False] * 2
+        h, donate[0] = hidden.val, False
         if k == self.policy.num_gpu_batches - 1:
-            (w_token,) = weight_read_buf.pop()
+            (w_token, donate[1]), = weight_read_buf.pop()
         else:
-            (w_token,) = weight_read_buf.val
+            (w_token, _), = weight_read_buf.val
         
         # The actual computation is simplified here. The backend will handle it.
         # The RoPE is applied in the attention layer, not here.
-        h = self.compute.mistral_input_embed(h, w_token)
+        h = self.compute.mistral_input_embed(h, w_token, donate)
         hidden.val = h
     
     def init_cache_one_gpu_batch(self, cache_home):
@@ -187,7 +187,7 @@ class OutputEmbed:
         self.task = task
 
     def init_weight(self, weight_home, path):
-        v, h, dtype = (self.config.vocab_size, self.config.hidden_size, self.config.dtype)
+        v, h, dtype = (self.config.vocab_size, self.config.input_dim, self.config.dtype)
         path = os.path.join(path, "")
         weight_specs = [
             # Mistral's final RMSNorm and lm_head names
@@ -202,20 +202,19 @@ class OutputEmbed:
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
-            weight_read_buf.store((
-                w_ln.smart_copy(dst2)[0],
-                w_lm_head.smart_copy(dst1)[0]
-            ))
+            weight_read_buf.store((w_ln.smart_copy(dst2),
+                w_lm_head.smart_copy(dst1)))
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
-        h = hidden.val
+        donate = [False] * 3
+        h, donate[0] = hidden.val, False
         if k == self.policy.num_gpu_batches - 1:
-            w_ln, w_lm_head = weight_read_buf.pop()
+            (w_ln, donate[1]), (w_lm_head, donate[2]) = weight_read_buf.pop()
         else:
-            w_ln, w_lm_head = weight_read_buf.val
+            (w_ln, _), (w_lm_head, _) = weight_read_buf.val
         
-        h = self.compute.mistral_output_embed(h, w_ln, w_lm_head,
+        h = self.compute.mistral_output_embed(h, w_ln, w_lm_head, donate,
             self.task.do_sample, self.task.temperature, self.config.rms_norm_eps)
         hidden.val = h
 
@@ -249,14 +248,14 @@ class SelfAttention:
         self.task = task
 
     def init_weight(self, weight_home, path):
-        h, dtype = (self.config.hidden_size, self.config.dtype)
+        h, dtype = (self.config.input_dim, self.config.dtype)
         # CHANGED: Path and weight names for Mistral's attention layer
         path = os.path.join(os.path.join(path, f"model.layers.{self.layer_id}."))
         weight_specs = [
             ((h,), dtype, path + "input_layernorm.weight.npy"),
             ((h, h), dtype, path + "self_attn.q_proj.weight.npy"),
-            ((self.config.num_key_value_heads * (h // self.config.num_attention_heads), h), dtype, path + "self_attn.k_proj.weight.npy"),
-            ((self.config.num_key_value_heads * (h // self.config.num_attention_heads), h), dtype, path + "self_attn.v_proj.weight.npy"),
+            ((self.config.num_key_value_heads * (h // self.config.n_head), h), dtype, path + "self_attn.k_proj.weight.npy"),
+            ((self.config.num_key_value_heads * (h // self.config.n_head), h), dtype, path + "self_attn.v_proj.weight.npy"),
             ((h, h), dtype, path + "self_attn.o_proj.weight.npy"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
@@ -267,11 +266,11 @@ class SelfAttention:
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
-            return (w_ln.smart_copy(dst2)[0],
-                    w_q.smart_copy(dst1)[0],
-                    w_k.smart_copy(dst1)[0],
-                    w_v.smart_copy(dst1)[0],
-                    w_out.smart_copy(dst1)[0])
+            return (w_ln.smart_copy(dst2),
+                    w_q.smart_copy(dst1),
+                    w_k.smart_copy(dst1),
+                    w_v.smart_copy(dst1),
+                    w_out.smart_copy(dst1))
 
     # init_cache, load_cache, store_cache, forward methods are kept as they are.
     def init_cache_one_gpu_batch(self, cache_home):
@@ -356,7 +355,7 @@ class SelfAttention:
         general_copy(v_home, indices, v_new, None)
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
-        return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
+        return (batch_size, seq_len, self.config.input_dim), self.config.dtype
     
     # The main logic changes for RoPE and GQA will be in the backend.
     # ... (rest of the SelfAttention class is conceptually similar) ...
@@ -366,62 +365,34 @@ class SelfAttention:
         donate = [False] * 8
         h, donate[0] = hidden.val, False
 
-        #(w_ln, donate[2]), (w_q, donate[3]), (w_k, donate[4]), \
-        #(w_v, donate[5]), (w_out, donate[6]) = attn_weights_tuple
+        (w_ln, donate[2]), (w_q, donate[3]), (w_k, donate[4]), \
+        (w_v, donate[5]), (w_out, donate[6]) = attn_weights_tuple
 
-        w_ln, w_q, w_k, w_v, w_out = attn_weights_tuple
-        
         if i == 0:  # prefill
-            #mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            #h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_ln, w_q, w_k, w_v, w_out,
-            #    self.config, donate, self.policy.compress_cache, self.policy.comp_cache_config)
-            #cache_write_buf.store((new_k_cache, new_v_cache))
-            
-            compute_device = self.attention_compute # (self.env.cpu or self.env.gpu)
-
-            # Copy all required tensors to compute device (CPU or GPU)
-            h_compute = hidden.val.copy(compute_device)
-            mask_compute = attention_mask.val.copy(compute_device)
-            w_ln_compute = w_ln.copy(compute_device)
-            w_q_compute = w_q.copy(compute_device)
-            w_k_compute = w_k.copy(compute_device)
-            w_v_compute = w_v.copy(compute_device)
-            w_out_compute = w_out.copy(compute_device)
-
-            # Perform the MHA computation on the selected device
-            # The `mha` function in the backend is device-agnostic.
-            h_result, new_k_cache, new_v_cache = compute_device.mha(
-                h_compute, mask_compute, 
-                w_ln_compute, w_q_compute, w_k_compute, w_v_compute, w_out_compute,
-                self.config, [False]*8, self.policy.compress_cache, self.policy.comp_cache_config
-            )
-
-            # Move results back to their designated homes
-            # The hidden state must return to the primary compute device (GPU) for the next layer.
-            hidden.val = h_result.move(self.compute)
-            
-            # The KV cache's home is determined by the offloading policy.
-            cache_home_device = self.env.cpu
-            cache_write_buf.store((
-                new_k_cache.move(cache_home_device),
-                new_v_cache.move(cache_home_device)
-            ))
+            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+            h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_ln, w_q, w_k, w_v, w_out,
+                self.config, donate, self.policy.compress_cache, self.policy.comp_cache_config)
+            cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
-            #donate_gen = [False] * 2
-            #h, donate_gen[0] = hidden.val, False
-            h = hidden.val
+            donate_gen = [False] * 2
+            h, donate_gen[0] = hidden.val, False
+            
+            # Unpack all weights from the tuple
+            (w_ln, donate_ln), (w_q, _), (w_k, _), \
+            (w_v, _), (w_out, _) = attn_weights_tuple
+            donate_gen[1] = donate_ln # Pass the donate flag for w_ln
 
             (k_cache_tuple, v_cache_tuple) = cache_read_buf.pop()
             k_cache = k_cache_tuple[0]
             v_cache = v_cache_tuple[0]
             
-            h_result, new_k_cache, new_v_cache = self.compute.mha_gen(
-                h, w_ln, w_q, w_k, w_v, w_out,
-                self.config, k_cache, v_cache, [False]*2, # Pass a dummy donate list
-                self.policy.compress_cache, self.policy.comp_cache_config
-            )
+            h, new_k_cache, new_v_cache = self.compute.mha_gen(h, w_ln, w_q, w_k, w_v, w_out,
+                self.config, k_cache, v_cache, donate_gen,
+                self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            hidden.val = h_result
+
+        hidden.val = h
+
 
 class MLP:
     # This class is heavily modified for Mistral's SwiGLU MLP.
@@ -439,7 +410,7 @@ class MLP:
         self.task = task
 
     def init_weight(self, weight_home, path):
-        h, f, dtype = (self.config.hidden_size, self.config.intermediate_size, self.config.dtype)
+        h, f, dtype = (self.config.input_dim, self.config.ffn_embed_dim, self.config.dtype)
         path = os.path.join(os.path.join(path, f"model.layers.{self.layer_id}."))
         weight_specs = [
             # Weights for SwiGLU
@@ -457,45 +428,22 @@ class MLP:
             dst1 = self.weight_load_dst
             dst2 = self.compute
             # Do not store here. Return the loaded tensors instead.
-            return (w_ln.smart_copy(dst2)[0],
-                    w_gate.smart_copy(dst1)[0],
-                    w_up.smart_copy(dst1)[0],
-                    w_down.smart_copy(dst1)[0])
+            return (w_ln.smart_copy(dst2),
+                    w_gate.smart_copy(dst1),
+                    w_up.smart_copy(dst1),
+                    w_down.smart_copy(dst1))
 
     def forward(self, hidden, cache_read_buf, mlp_weights_tuple, attention_mask,
                 cache_write_buf, i, k):
         donate = [False] * 5
         h, donate[0] = hidden.val, False #for safety
 
-        # 1. Determine the compute device based on the policy.
-        #    Decoding (i > 0) is always on GPU.
-        if i == 0 and self.policy.cpu_cache_compute:
-            compute_device = self.env.cpu
-        else:
-            compute_device = self.env.gpu
+        (w_ln, donate[1]), (w_gate, donate[2]), \
+        (w_up, donate[3]), (w_down, donate[4]) = mlp_weights_tuple
 
-        # 2. Unpack weights
-        #(w_ln, donate[1]), (w_gate, donate[2]), \
-        #(w_up, donate[3]), (w_down, donate[4]) = mlp_weights_tuple
-        w_ln, w_gate, w_up, w_down = mlp_weights_tuple
-
-        # 3. Move all required tensors to the compute device (CPU or GPU)
-        h_compute = hidden.val.copy(compute_device)
-        w_ln_compute = w_ln.copy(compute_device)
-        w_gate_compute = w_gate.copy(compute_device)
-        w_up_compute = w_up.copy(compute_device)
-        w_down_compute = w_down.copy(compute_device)
-
-        # 4. Perform the MLP computation on the selected device.
-        mlp_result = compute_device.mistral_mlp(
-            h_compute, 
-            w_ln_compute, w_gate_compute, w_up_compute, w_down_compute,
-            self.config.rms_norm_eps, [False]*5
-        )
-        
-        # 5. Move the final result back to the primary compute device (GPU) and
-        #    update the `hidden` ValueHolder for the next layer or output.
-        hidden.val = mlp_result.move(self.compute)
+        h = self.compute.mistral_mlp(h, w_ln, w_gate, w_up, w_down, 
+                                     self.config.rms_norm_eps, donate)
+        hidden.val = h
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass
@@ -535,7 +483,6 @@ class MistralLayer:
     # forward logic is kept, as it just calls sub-layers
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
-        
         # 1. Unpack weights for both sub-layers.
         #    This follows the simplified structure from the corrected `load_weight`.
         if k == self.policy.num_gpu_batches - 1:
@@ -545,12 +492,32 @@ class MistralLayer:
             # Peek at the buffer for other batches.
             attn_weights_tuple, mlp_weights_tuple = weight_read_buf.val
 
-        # Self-Attention Block
+        # 2. First Residual Connection: Store the input.
+        #    The input to the layer (`hidden.val`) is the value `x_l`.
+        #    `h_attn` will be `Attention(LN(x_l))`.
+        #    The first residual is `x_l + h_attn`.
+        residual = hidden.val
+
+        # 3. Self-Attention Block
+        #    The `hidden` ValueHolder is passed to be modified in-place.
+        #    The `self_attention.forward` will compute `Attention(LN(x_l))` and
+        #    perform its own residual connection, so `hidden.val` becomes `x_l + h_attn`.
         self.attention.forward(hidden, cache_read_buf, attn_weights_tuple, attention_mask,
                                cache_write_buf, i, k)
+        
+        # 4. Second Residual Connection: Store the output of the attention block.
+        #    The input to the MLP block is `x_l + h_attn`.
+        #    `h_mlp` will be `MLP(LN(x_l + h_attn))`.
+        #    The final output of the layer is `(x_l + h_attn) + h_mlp`.
+        #residual = hidden.val
 
-        # MLP Block 
+        # 5. MLP Block
+        #    The `self.mlp.forward` will compute `MLP(LN(x_l + h_attn))` and
+        #    perform its own residual connection, so `hidden.val` becomes
+        #    `(x_l + h_attn) + h_mlp`.
         self.mlp.forward(hidden, None, mlp_weights_tuple, attention_mask, None, i, k)
+
+        # The `hidden` ValueHolder now contains the final output of the MistralLayer.
 
     # Other methods like init_cache, load_cache, store_cache are delegated to SelfAttention
     def init_cache_one_gpu_batch(self, cache_home):
@@ -562,9 +529,6 @@ class MistralLayer:
 
 
 class MistralLM:
-    
-    config_class = MistralConfig
-
     def __init__(self,
                  config: MistralConfig,
                  env: ExecutionEnv,
@@ -574,7 +538,6 @@ class MistralLM:
         #if isinstance(config, str):
         #    config = get_mistral_config(config)
         self.config = config
-
         self.model_id = model_id
         self.env = env
         self.path = path
@@ -778,7 +741,7 @@ class MistralLM:
         for k in range(num_gpu_batches):
             self.attention_mask[k].clear()
 
-        task = Task(inputs=inputs, prompt_len=inputs.shape[1], gen_len=max_new_tokens,
+        task = Task(inputs=inputs, prompt_len=len(inputs[0]), gen_len=max_new_tokens,
                     cut_gen_len=None, do_sample=do_sample, temperature=temperature, stop=stop)
         self.execute_gen_len = task.gen_len
         self.output_ids = np.full((len(task.inputs), task.prompt_len + task.gen_len),

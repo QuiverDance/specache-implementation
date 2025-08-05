@@ -7,7 +7,7 @@
   "policy_args":{
     "gpu_batch_size": 2,
     "num_gpu_batches": 1,
-    "percent":[100, 0, 100, 0, 100, 0],
+    "percent":[100, 0, 0, 100, 0, 100],
     "pin_weight": true,
     "cpu_cache_compute": false,
     "compress_weigth" : false,
