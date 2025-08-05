@@ -27,19 +27,21 @@ from flexgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
 
 def build_qasper_prompt(item, tokenizer, max_length):
     
-    prompt_template = "Write a high-quality answer for the given question using only the provided search results (some of which might be irrelevant).\n\n{context}\n\nQuestion: {question}\n\nAnswer:"
+    question = item['input']
+    context = item['context']
 
-    question_part = f"\n\nQuestion: {item['input']}\n\nAnswer:"
-    question_tokens = tokenizer.encode(question_part, add_special_tokens=False)
+    user_content = (
+        "You are a helpful research assistant.\n\n"
+        "Read the following context and answer the question concisely.\n\n"
+        f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+    )
 
-    max_context_len = max_length - len(question_tokens)
-
-    context_tokens = tokenizer.encode(item['context'], add_special_tokens=False)
-    truncated_context_tokens = context_tokens[:max_context_len]
-    truncated_context = tokenizer.decode(truncated_context_tokens)
-
-    prompt = prompt_template.format(context=truncated_context, question=item['input'])
-    return f"[Inst] {prompt.strip()} [/INST]"
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": user_content}],
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    return prompt 
 
 def normalize_answer(s):
     def remove_articles(text):
@@ -54,8 +56,14 @@ def normalize_answer(s):
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 def postprocess_qasper_answer(pred):
-    pred = pred.strip().split("\n")[0]
-    return pred
+    text = pred.strip()
+    if text.lower().startswith("answer:"):
+        text = text[len("answer:"):].strip()
+
+    para_end = text.find("\n\n")
+    if para_end != -1:
+        text = text[:para_end].strip()
+    return text
 
 def f1_score(prediction, ground_truth):
     prediction_tokens = normalize_answer(prediction).split()
@@ -85,6 +93,22 @@ TASK_MAPPING = {
     }
     #add another benchmark test.
 }
+
+def to_str_list(x):
+    if isinstance(x, str):
+        return [x]
+    if isinstance(x, list):
+        if len(x) > 0 and isinstance(x[0], dict):
+            return [d.get('text', str(d)) for d in x]
+        return [str(e) for e in x]
+    if isinstance(x, dict):
+        for k in ('text', 'answer', 'answers')
+        if k in x and isinstance(x[k], str):
+            return [x[k]]
+        if k in x and isinstance(x[k], list):
+            return [str(e) for e in x[k]]
+        return [str(x)]
+    return [str(x)]
 
 def run_benchmark(config):
     
@@ -179,7 +203,9 @@ def run_benchmark(config):
         for idx, text in enumerate(output_texts):
             prediction = task_handler['postprocessor'](text)
             predictions.append(prediction)
-            references.append(batch_slice[task_handler['ref_key']][idx])
+
+            raw_ref = batch_slice[task_handler['ref_key']][idx]
+            references.append(to_str_list(raw_ref))
 
     print("Evaluating results...")
     metrics = task_handler['evaluator'](predictions, references)
