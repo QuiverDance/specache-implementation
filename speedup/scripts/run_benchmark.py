@@ -102,13 +102,53 @@ def to_str_list(x):
             return [d.get('text', str(d)) for d in x]
         return [str(e) for e in x]
     if isinstance(x, dict):
-        for k in ('text', 'answer', 'answers')
-        if k in x and isinstance(x[k], str):
-            return [x[k]]
-        if k in x and isinstance(x[k], list):
-            return [str(e) for e in x[k]]
+        for k in ('text', 'answer', 'answers'):
+            if k in x and isinstance(x[k], str):
+                return [x[k]]
+            if k in x and isinstance(x[k], list):
+                return [str(e) for e in x[k]]
         return [str(x)]
     return [str(x)]
+
+
+def slice_generation(output_ids, prompt_len):
+    if output_ids.shape[1] <= prompt_len:
+        return output_ids[:, 0:0]
+    return output_ids[:, prompt_len:]
+
+def postprocess_and_count_tokens(predictions_ids, prompts_ids, tokenizer):
+    """
+    Decode generated ID and Cut based on EOS tokens.
+    It also counts the number of valid tokens actually generated.
+    """
+    # To find the EOS location by decoding it, including the special token.
+    decoded_texts = tokenizer.batch_decode(predictions_ids, skip_special_tokens=False)
+
+    actual_generated_tokens = 0
+    processed_texts = []
+
+    eos_token = tokenizer.eos_token
+    pad_token_id = tokenizer.pad_token_id
+
+    for i, text in enumerate(decoded_texts):
+        # If you have EOS tokens, only use the content up to that point
+        if eos_token in text:
+            text = text.split(eos_token)[0]
+
+        # Calculating the number of valid tokens: excluding padding after EOS
+        pred_ids_single = predictions_ids[i]
+        valid_token_indices = np.where(pred_ids_single == tokenizer.eos_token_id)
+
+        if len(valid_token_indices[0]) > 0:
+            first_eos_index = valid_token_indices[0][0]
+            actual_generated_tokens += first_eos_index
+        else:
+            # If there is no EOS, count the entire token, not the padding.
+            actual_generated_tokens += np.sum(pred_ids_single != pad_token_id)
+
+        processed_texts.append(text)
+
+    return processed_texts, actual_generated_tokens
 
 def run_benchmark(config):
     
@@ -128,6 +168,7 @@ def run_benchmark(config):
         tokenizer.pad_token = tokenizer.eos_token
 
     mistral_config = get_mistral_config(model_args['model'])
+    max_input_len = mistral_config.max_position_embeddings - benchmark_args['max_new_tokens']
 
     gpu = TorchDevice("cuda:0", config=mistral_config)
     cpu = TorchDevice("cpu", config=mistral_config)
@@ -154,8 +195,6 @@ def run_benchmark(config):
     #PRACTICAL_MAX_LEN = 2048
     #max_input_len = min(mistral_config.max_position_embeddings - benchmark_args['max_new_tokens'], PRACTICAL_MAX_LEN)
     
-    max_input_len = mistral_config.max_position_embeddings
-
     predictions = []
     references = []
 
@@ -175,30 +214,47 @@ def run_benchmark(config):
             prompt = task_handler['prompt_builder'](item, tokenizer, max_input_len)
             batch_prompts.append(prompt)
 
-        inputs_np = tokenizer(
+        tokenized_inputs = tokenizer(
             batch_prompts, 
             return_tensors="np", 
             padding=True,
-            ).input_ids
-        
+            truncation=True,
+            max_length=max_input_len
+        )
+        inputs_np = tokenized_inputs['input_ids']
+        attention_mask = tokenized_inputs['attention_mask']
+
         print(f'Input shape for batch {i//total_batch_size + 1}: {inputs_np.shape}')
         start_time = time.time()
 
         output_ids = model.generate(
-            inputs=inputs_np,
+            inputs={'input_ids': inputs_np, 'attention_mask': attention_mask},
             max_new_tokens=benchmark_args['max_new_tokens'],
+            #min_new_tokens=1,
+            #do_sample=True,
+            #temperature=0.7
         )
-        
+
         end_time = time.time()
         total_duration_sec += (end_time - start_time)
 
-        prompt_tokens_in_batch = np.sum(inputs_np != tokenizer.pad_token_id)
-        generated_tokens_in_batch = np.sum(output_ids[:, inputs_np.shape[1]:] != tokenizer.pad_token_id)
+        prompt_len = inputs_np.shape[1]
 
-        total_prompt_tokens += prompt_tokens_in_batch
+        #gen_ids = slice_generation(output_ids, prompt_len)
+        gen_ids = output_ids[:, prompt_len:]
+
+        #output_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=False)
+        output_texts, generated_tokens_in_batch = postprocess_and_count_tokens(
+            gen_ids, inputs_np, tokenizer
+        )
         total_generated_tokens += generated_tokens_in_batch
+        
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-        output_texts = tokenizer.batch_decode(output_ids[:, inputs_np.shape[1]:], skip_special_tokens=True)
+        #for metrics 
+        prompt_tokens_in_batch = np.sum(attention_mask)
+        total_prompt_tokens += prompt_tokens_in_batch
 
         for idx, text in enumerate(output_texts):
             prediction = task_handler['postprocessor'](text)
@@ -206,6 +262,8 @@ def run_benchmark(config):
 
             raw_ref = batch_slice[task_handler['ref_key']][idx]
             references.append(to_str_list(raw_ref))
+        print("DEBUG answer example :", references[-1])
+        print("DEBUG pred example :", predictions[-1][:140])
 
     print("Evaluating results...")
     metrics = task_handler['evaluator'](predictions, references)

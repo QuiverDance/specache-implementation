@@ -285,7 +285,7 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=-1, keepdim=True)
         
         return TorchTensor.create_from_torch(ids, self)
-
+    
     def init_cache_one_gpu_batch(self, config, task, policy):
         """
         Allocates a KV cache for one GPU batch on this device.
@@ -312,7 +312,7 @@ class TorchDevice:
         return k_cache, v_cache
 
     def mha(self, inputs, attention_mask, w_ln, w_q, w_k, w_v, w_out,
-            config, donate, compress_cache, comp_config):
+            config, donate, compress_cache, comp_config, chunk_size=1024):
         """
         Multi-Head Attention for prefill stage.
         """
@@ -337,9 +337,25 @@ class TorchDevice:
         
         # 4. Apply RoPE
         target_device = inputs.device.dev
-        position_ids = torch.arange(0, s, dtype=torch.long, device=target_device).unsqueeze(0)
-        cos, sin = self.rotary_emb(v, seq_len=s)
+        #position_ids = torch.arange(0, s, dtype=torch.long, device=inputs.device.dev).unsqueeze(0)
+        #cos, sin = self.rotary_emb(v, seq_len=s)
+        #q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+
+        # Calculate sin/cos frequencies directly. This logic is from MistralRotaryEmbedding.
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=target_device, dtype=torch.float32) / head_dim))
+        t = torch.arange(s, device=target_device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        cos = emb.cos().to(q.dtype)
+        sin = emb.sin().to(q.dtype)
+        
+        position_ids = torch.arange(s, device=target_device).unsqueeze(0)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        
+        # diagnose code
+        if torch.isnan(q).any() or torch.isnan(k).any() or torch.isnan(v).any():
+            print("!!! CRITICAL: NaN detected in Q, K, or V after projection and RoPE !!!")
 
         # 5. Create cache from a copy of ORIGINAL k and v, BEFORE GQA repeat.
         # The shape of the cache should be [batch, num_kv_heads, seq_len, head_dim].
@@ -350,15 +366,47 @@ class TorchDevice:
         n_rep = config.num_attention_heads // config.num_key_value_heads
         k_for_attn = self.repeat_kv(k, n_rep)
         v_for_attn = self.repeat_kv(v, n_rep)
-        
-        # 7. Caluate Attention
-        causal_mask = torch.triu(torch.ones(s, s, device=target_device, dtype=torch.bool), diagonal=1)
-        inverted_padding_mask = (attention_mask.data == 0).view(b, 1, 1, s)
-        final_mask = inverted_padding_mask | causal_mask
+       
+        # 7. Prepare the full attention masks once.
+        padding_mask = (attention_mask.data == 0).view(b, 1, 1, s)
+        full_causal_mask = torch.triu(torch.ones(s, s, device=target_device, dtype=torch.bool), diagonal=1)
+        # The final mask needs to be broadcastable to the chunk's attention weights.
+        final_mask = padding_mask | full_causal_mask.unsqueeze(0).unsqueeze(0)
 
-        value = torch.nn.functional.scaled_dot_product_attention(
-            q, k_for_attn, v_for_attn, attn_mask=final_mask
-        )
+        # 8. Caluate Attention
+        output_chunks = []
+        # Manually iterate through chunks to track the start index.
+        for chunk_start in range(0, s, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, s)
+            q_chunk = q[:, :, chunk_start:chunk_end, :]
+            s_chunk = q_chunk.shape[2]
+            
+            q_chunk_fp32 = q_chunk.to(torch.float32)
+            k_for_attn_fp32 = k_for_attn.to(torch.float32)
+
+            attn_weights_chunk = torch.matmul(q_chunk, k_for_attn.transpose(2, 3))
+            attn_weights_chunk = attn_weights_chunk / np.sqrt(head_dim)
+            
+            # Apply the correctly sliced mask.
+            mask_chunk = final_mask[:, :, chunk_start:chunk_end, :]
+
+            # Apply the mask by filling masked positions with a large negative value.
+            attn_weights_chunk = attn_weights_chunk.masked_fill(mask_chunk, torch.finfo(attn_weights_chunk.dtype).min)
+
+            attn_weights_chunk = F.softmax(attn_weights_chunk, dim=-1)
+        
+            value_chunk = torch.matmul(attn_weights_chunk, v_for_attn)
+            output_chunks.append(value_chunk)
+        
+        value = torch.cat(output_chunks, dim=2)
+        
+        # diagnose code
+        if torch.isnan(value).any():
+            print("!!! CRITICAL: NaN detected in attention output ('value') !!!")
+            
+            print("q[0,0,0,:5]:", q[0,0,0,:5])
+            print("k_for_attn[0,0,0,:5]:", k_for_attn[0,0,0,:5])
+            print("softmax(q*k)[0,0,0,:5]:", F.softmax(torch.matmul(q, k_for_attn.transpose(-2, -1)) / (head_dim**0.5), dim=-1)[0,0,0,:5])
 
         # 8. Output Projection and Residual Connection
         value = value.transpose(1, 2).contiguous().view(b, s, h)
@@ -401,10 +449,27 @@ class TorchDevice:
         
         # 4. Apply RoPE
         # k_cache shape is [b, num_kv_h, seq_len, h_dim].
+        target_device = inputs.device.dev
         past_key_values_length = k_cache.shape[2] 
-        position_ids = torch.tensor([[past_key_values_length]], dtype=torch.long, device=self.dev)
+        current_seq_len = past_key_values_length + s # s is 1
         
-        cos, sin = self.rotary_emb(v, seq_len=past_key_values_length + 1)
+        #cos, sin = self.rotary_emb(v, seq_len=past_key_values_length + s)
+        #position_ids = torch.arange(past_key_values_length, past_key_values_length + s,
+        #                            dtype=torch.long, device=inputs.device.dev).unsqueeze(0)
+
+        #q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+ 
+        # Calculate sin/cos frequencies directly.
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=target_device, dtype=torch.float32) / head_dim))
+        t = torch.arange(past_key_values_length, current_seq_len, device=target_device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        cos = emb.cos().to(q.dtype)
+        sin = emb.sin().to(q.dtype)
+        
+        # Apply the computed sin/cos to Q and K.
+        position_ids = torch.arange(s, device=target_device).unsqueeze(0)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         # 5. Concatenate current K, V to past cache
@@ -417,6 +482,7 @@ class TorchDevice:
         v_for_attn = self.repeat_kv(v_cache_updated, n_rep)
         
         # 7. Attention Score Calculation and Value
+        
         attn_weights = torch.matmul(q, k_for_attn.transpose(2, 3)) / np.sqrt(head_dim)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
         value = torch.matmul(attn_weights, v_for_attn)

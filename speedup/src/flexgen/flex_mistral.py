@@ -323,17 +323,11 @@ class SelfAttention:
         # shape: (s, b * n_head, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
-
+        
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
-
-        # Our tensor shape: (batch, num_heads, seq_len, head_dim)
-        # The sequence length is at dimension 2.
-        
+                
         if i == 0:  # Prefill stage
-            # We need to copy the new cache (seq_len = prompt_len) into the
-            # beginning of the home cache.
-            # k_new.shape[2] will be the prompt_length.
             indices = (
                 slice(0, k_new.shape[0]),       # Full batch dimension
                 slice(0, k_new.shape[1]),       # Full num_heads dimension
@@ -351,7 +345,6 @@ class SelfAttention:
                 slice(0, k_new.shape[3]),       # Full head_dim dimension
             )
         
-        # Now, `k_home` sliced by `indices` and `k_new` will have the same shape.
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
@@ -615,11 +608,35 @@ class MistralLM:
 
         self.task = None
         self.init_all_weights()
+        #self.diagnose_weights() for debugging model weights init
 
     def set_task(self, task):
         self.task = task
         for l in self.layers:
             l.set_task(task)
+
+    def diagnose_weights(self):
+        print("\n--- Running Weight Diagnostics ---")
+        try:
+            layer_0_weights = self.weight_home[1].val[0].val # MistralLayer -> SelfAttention -> weights
+            q_proj_weight = layer_0_weights[1] # w_q
+
+            weight_tensor = q_proj_weight.smart_copy(self.env.cpu)[0].data
+            
+            if torch.isnan(weight_tensor).any():
+                print("!!! CRITICAL: NaN found in weights !!!")
+            elif torch.isinf(weight_tensor).any():
+                print("!!! CRITICAL: Inf found in weights !!!")
+            elif weight_tensor.abs().mean().item() < 1e-6:
+                print(f"!!! WARNING: Weights mean absolute value is very low ({weight_tensor.abs().mean().item()}). May indicate loading issue.")
+            else:
+                print("Weight diagnostics passed. Basic stats for layer 0 q_proj:")
+                print(f"  - Mean: {weight_tensor.mean().item():.4f}")
+                print(f"  - Std:  {weight_tensor.std().item():.4f}")
+                print(f"  - Abs Mean: {weight_tensor.abs().mean().item():.4f}")
+        except Exception as e:
+            print(f"!!! ERROR during weight diagnostics: {e} !!!")
+        print("--------------------------------\n")
 
     def init_weight(self, j, path):
         self.layers[j].init_weight(self.weight_home[j], path)
@@ -700,10 +717,21 @@ class MistralLM:
         if j == -1:
             j = self.num_layers - 1; i -= 1
             if i == -1: return
+        
         if j == self.num_layers - 1:
+            # This is the final layer, process the output logits
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
-            ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+
+            # Pop the final TorchTensor (which contains logits on GPU)
+            final_hidden_tensor = self.hidden[i][j][k].pop()
+
+            # Get the raw torch.Tensor data and move to CPU for numpy conversion
+            ids = final_hidden_tensor.data.detach().cpu().numpy()
+            
+            # Explicitly delete the GPU tensor after use
+            final_hidden_tensor.delete()
+
             pos = self.task.prompt_len + i
             if self.task.stop:
                 stopped = self.stopped[left:right]
@@ -712,9 +740,22 @@ class MistralLM:
             else:
                 self.output_ids[left:right, pos:pos+1] = ids
         else:
+            # This is an intermediate layer, move hidden state to its home device (CPU/Disk)
             x = self.hidden[i][j][k]
             if x.val:
-                x.val = x.val.move(self.act_home)
+                # Get the TorchTensor to be moved
+                tensor_to_move = x.val
+
+                # Use the copy() method to create a new tensor on the home device.
+                # This creates a true, deep copy of the data on the target device.
+                new_tensor_on_home = tensor_to_move.copy(self.act_home)
+
+                # Replace the old tensor in the ValueHolder with the new one
+                x.val = new_tensor_on_home
+
+                # Delete the original GPU tensor to free VRAM
+                tensor_to_move.delete()
+                #x.val = x.val.move(self.act_home)
 
     def compute_layer(self, i, j, k):
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
@@ -750,15 +791,23 @@ class MistralLM:
         # the causal attention is implicitly handled by the model architecture and
         # the position_ids passed to RoPE. We do not need to extend the mask.
         if i > 0:
+            if self.attention_mask[k].val is not None:
+                self.attention_mask[k].val.delete()
+                self.attention_mask[k].clear()
             return
+
         gpu_batch_size = self.policy.gpu_batch_size
         left = k * gpu_batch_size
         right = left + gpu_batch_size
-        input_ids = self.output_ids[left:right, :self.task.prompt_len]
+        
+        padded_len = self.task.padded_len
+        input_ids = self.output_ids[left:right, :padded_len]
 
         attention_compute = (self.env.cpu if self.policy.cpu_cache_compute else self.env.gpu)
-        val = attention_compute.allocate((self.policy.gpu_batch_size, self.task.prompt_len), bool)
-        val.load_from_np((input_ids != self.config.pad_token_id))
+        val = attention_compute.allocate((self.policy.gpu_batch_size, padded_len), bool)
+
+        mask_np = (input_ids != self.config.pad_token_id)
+        val.load_from_np(mask_np)
         self.attention_mask[k].store(val)
 
     def generate(self, inputs: Union[np.array, List[List[int]]], max_new_tokens: int = 32,
@@ -767,6 +816,8 @@ class MistralLM:
 
         # 1. Clear all buffers at the beginning of each generation call.
         # This ensures that values from previous calls (like warmup) do not interfere.
+        #self.env.gpu.reset_rope_cache(self.config)
+
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         for j in range(num_layers):
             self.weight_read_buf[j].clear()
@@ -778,13 +829,28 @@ class MistralLM:
         for k in range(num_gpu_batches):
             self.attention_mask[k].clear()
 
-        task = Task(inputs=inputs, prompt_len=inputs.shape[1], gen_len=max_new_tokens,
-                    cut_gen_len=None, do_sample=do_sample, temperature=temperature, stop=stop)
+        if isinstance(inputs, dict):
+            input_ids = inputs['input_ids']
+            attention_mask = inputs.get('attention_mask')
+            prompt_len = int(np.sum(attention_mask[0])) # actual length
+            padded_len = input_ids.shape[1]             # including padding
+        else:
+            #list or numpy array
+            input_ids = np.asarray(inputs)
+            attention_mask = (input_ids != self.config.pad_token_id)
+            prompt_len = int(np.sum(attention_mask[0]))
+            padded_len = input_ids.shape[1]
+
+        task = Task(inputs=input_ids, prompt_len=prompt_len, padded_len=padded_len,
+                    gen_len=max_new_tokens, cut_gen_len=None,
+                    do_sample=do_sample, temperature=temperature, stop=stop)
+
         self.execute_gen_len = task.gen_len
-        self.output_ids = np.full((len(task.inputs), task.prompt_len + task.gen_len),
+        self.output_ids = np.full((len(task.inputs), padded_len + task.gen_len),
             self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
-        self.output_ids[:, :task.prompt_len] = np.asarray(task.inputs)
+        self.output_ids[:, :padded_len] = task.inputs
+
         assert self.policy.gpu_batch_size * self.policy.num_gpu_batches == len(task.inputs)
         
         for j in range(self.num_layers):
@@ -799,16 +865,36 @@ class MistralLM:
         # Simplified generation loop for clarity
         for i in tqdm(range(self.execute_gen_len), desc="Generating tokens"):
             timers("generate").start()
+            
+            # Synchronize before starting a new generation step.
+            self.sync()
+
             for k in range(self.policy.num_gpu_batches):
                 self.update_attention_mask(i, k)
+
             for j in range(self.num_layers):
+                # Load weights (already synchronous in nature)
                 self.load_weight(i, j, 0, overlap=False)
+
+                # Load cache and hidden states
                 self.load_cache(i, j, 0, overlap=False)
                 self.load_hidden(i, j, 0)
-                self.compute_layer(i, j, 0)
+                
+                # Synchronize before computation.
+                # Ensures all data (weights, cache, hidden) is fully loaded and ready on the GPU.
                 self.sync()
+
+                self.compute_layer(i, j, 0)
+
+                # Synchronize after computation.
+                # Ensures the forward pass is complete before moving data around.
+                self.sync()
+                
                 self.store_hidden(i, j, 0)
                 self.store_cache(i, j, 0, overlap=False)
+
+                # Synchronize after storing data.
+                self.sync()
             timers("generate").stop()
 
         for j in range(self.num_layers):

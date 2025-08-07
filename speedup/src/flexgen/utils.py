@@ -40,6 +40,7 @@ class Task:
     """A generation task."""
     inputs: Union[np.array, List[List[int]]]
     prompt_len: int
+    padded_len: int
     gen_len: int
     cut_gen_len: Optional[int]
 

@@ -1,7 +1,7 @@
 {
   "model_args":{
     "model": "mistralai/Mistral-7B-Instruct-v0.2",
-    "path":"~/flexgen_weights",
+    "path":"~/flexgen_weights/mistralai/Mistral-7B-Instruct-v0.2-np",
     "offload_dir": "~/flexgen_offload_dir"
   },
   "policy_args":{
