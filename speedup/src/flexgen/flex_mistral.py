@@ -164,14 +164,13 @@ class InputEmbed:
         hidden.val = h
     
     def init_cache_one_gpu_batch(self, cache_home):
-        pass  # do nothing
+        pass
 
     def load_cache(self, cache_home, cache_read_buf, i):
-        pass  # do nothing
+        pass
 
     def store_cache(self, cache_home, cache_write_buf, i):
-        pass  # do nothing
-
+        pass
 
 class OutputEmbed:
     def __init__(self, config, env, policy):
@@ -296,12 +295,16 @@ class SelfAttention:
             return
         
         k_home, v_home = cache_home.val
+        
         dst = self.attention_compute
+        
+        #dst = self.compute
 
         # Our cache shape: (batch, num_heads, seq_len, head_dim)
         # We need to load the cache up to the current sequence length.
         # The sequence length for decoding step `i` is `prompt_len + i`.
-        current_seq_len = self.task.prompt_len + i
+        # the past length must be prompt_len + i - 1
+        current_seq_len = self.task.prompt_len + i - 1
 
         # Remove the unnecessary `attn_sparsity` check and related logic.
         # We will always use dense attention for our baseline.
@@ -337,7 +340,7 @@ class SelfAttention:
         else:  # Decoding stage
             # We need to update a single token position in the cache.
             # The new cache (k_new) will have seq_len = 1.
-            pos = self.task.prompt_len + i
+            pos = self.task.prompt_len + i - 1
             indices = (
                 slice(0, k_new.shape[0]),       # Full batch dimension
                 slice(0, k_new.shape[1]),       # Full num_heads dimension
@@ -359,16 +362,9 @@ class SelfAttention:
         donate = [False] * 8
         h, donate[0] = hidden.val, False
 
-        #(w_ln, donate[2]), (w_q, donate[3]), (w_k, donate[4]), \
-        #(w_v, donate[5]), (w_out, donate[6]) = attn_weights_tuple
-
         w_ln, w_q, w_k, w_v, w_out = attn_weights_tuple
         
         if i == 0:  # prefill
-            #mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            #h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_ln, w_q, w_k, w_v, w_out,
-            #    self.config, donate, self.policy.compress_cache, self.policy.comp_cache_config)
-            #cache_write_buf.store((new_k_cache, new_v_cache))
             
             compute_device = self.attention_compute # (self.env.cpu or self.env.gpu)
 
@@ -400,21 +396,34 @@ class SelfAttention:
                 new_v_cache.move(cache_home_device)
             ))
         else:  # decoding
-            #donate_gen = [False] * 2
-            #h, donate_gen[0] = hidden.val, False
-            h = hidden.val
+            # Current absolute position where the new token's KV should be stored
+            cache_pos = self.task.prompt_len + i  # padded_len 기반 (run_benchmark에서 그렇게 셋업됨)
 
+            # Move inputs and weights to the compute device
+            compute_device = self.attention_compute
+            h_compute = hidden.val.copy(compute_device)
+
+            w_ln_compute = attn_weights_tuple[0].copy(compute_device)
+            w_q_compute  = attn_weights_tuple[1].copy(compute_device)
+            w_k_compute  = attn_weights_tuple[2].copy(compute_device)
+            w_v_compute  = attn_weights_tuple[3].copy(compute_device)
+            w_out_compute= attn_weights_tuple[4].copy(compute_device)
+
+            # Read previously-filled cache up to current position
             (k_cache_tuple, v_cache_tuple) = cache_read_buf.pop()
             k_cache = k_cache_tuple[0]
             v_cache = v_cache_tuple[0]
-            
-            h_result, new_k_cache, new_v_cache = self.compute.mha_gen(
-                h, w_ln, w_q, w_k, w_v, w_out,
-                self.config, k_cache, v_cache, [False]*2, # Pass a dummy donate list
-                self.policy.compress_cache, self.policy.comp_cache_config
+
+            # Compute attention for a single step and get ONLY the new KV slice
+            h_result, k_new, v_new = compute_device.mha_gen(
+                h_compute, w_ln_compute, w_q_compute, w_k_compute, w_v_compute, w_out_compute,
+                self.config, k_cache, v_cache, [False]*2, self.policy.compress_cache, self.policy.comp_cache_config,
+                cache_pos=cache_pos
             )
-            cache_write_buf.store((new_k_cache, new_v_cache))
-            hidden.val = h_result
+
+            hidden.val = h_result.move(self.compute)
+            cache_write_buf.store((k_new.move(self.env.cpu), v_new.move(self.env.cpu)))
+
 
 class MLP:
     # This class is heavily modified for Mistral's SwiGLU MLP.
@@ -468,8 +477,6 @@ class MLP:
             compute_device = self.env.gpu
 
         # 2. Unpack weights
-        #(w_ln, donate[1]), (w_gate, donate[2]), \
-        #(w_up, donate[3]), (w_down, donate[4]) = mlp_weights_tuple
         w_ln, w_gate, w_up, w_down = mlp_weights_tuple
 
         # 3. Move all required tensors to the compute device (CPU or GPU)
@@ -816,7 +823,6 @@ class MistralLM:
 
         # 1. Clear all buffers at the beginning of each generation call.
         # This ensures that values from previous calls (like warmup) do not interfere.
-        #self.env.gpu.reset_rope_cache(self.config)
 
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         for j in range(num_layers):

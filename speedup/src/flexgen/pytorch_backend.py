@@ -337,20 +337,18 @@ class TorchDevice:
         
         # 4. Apply RoPE
         target_device = inputs.device.dev
-        #position_ids = torch.arange(0, s, dtype=torch.long, device=inputs.device.dev).unsqueeze(0)
-        #cos, sin = self.rotary_emb(v, seq_len=s)
-        #q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-
-        # Calculate sin/cos frequencies directly. This logic is from MistralRotaryEmbedding.
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=target_device, dtype=torch.float32) / head_dim))
-        t = torch.arange(s, device=target_device, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-
-        cos = emb.cos().to(q.dtype)
-        sin = emb.sin().to(q.dtype)
         
-        position_ids = torch.arange(s, device=target_device).unsqueeze(0)
+        # Build position_ids from attention_mask so pads don't increase positions
+        # attention_mask: [B, S] with 1 for real tokens, 0 for pads (left padding)
+        am = attention_mask.data.to(q.device)                 # [B,S], {0,1}
+        position_ids = am.cumsum(dim=1) - 1                   # pads -> -1, tokens -> 0..len-1
+        position_ids = position_ids.clamp_min(0).to(torch.long)  # [-1]->0, shape [B,S]
+
+        # Rotary caches up to max position
+        max_pos = int(position_ids.max().item()) + 1
+        cos, sin = self.rotary_emb(v, seq_len=max_pos)
+        
+        # Apply rotary embedding to Q and K
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
         
         # diagnose code
@@ -366,7 +364,7 @@ class TorchDevice:
         n_rep = config.num_attention_heads // config.num_key_value_heads
         k_for_attn = self.repeat_kv(k, n_rep)
         v_for_attn = self.repeat_kv(v, n_rep)
-       
+      
         # 7. Prepare the full attention masks once.
         padding_mask = (attention_mask.data == 0).view(b, 1, 1, s)
         full_causal_mask = torch.triu(torch.ones(s, s, device=target_device, dtype=torch.bool), diagonal=1)
@@ -379,11 +377,8 @@ class TorchDevice:
         for chunk_start in range(0, s, chunk_size):
             chunk_end = min(chunk_start + chunk_size, s)
             q_chunk = q[:, :, chunk_start:chunk_end, :]
-            s_chunk = q_chunk.shape[2]
             
-            q_chunk_fp32 = q_chunk.to(torch.float32)
-            k_for_attn_fp32 = k_for_attn.to(torch.float32)
-
+    
             attn_weights_chunk = torch.matmul(q_chunk, k_for_attn.transpose(2, 3))
             attn_weights_chunk = attn_weights_chunk / np.sqrt(head_dim)
             
@@ -394,10 +389,10 @@ class TorchDevice:
             attn_weights_chunk = attn_weights_chunk.masked_fill(mask_chunk, torch.finfo(attn_weights_chunk.dtype).min)
 
             attn_weights_chunk = F.softmax(attn_weights_chunk, dim=-1)
-        
+            
             value_chunk = torch.matmul(attn_weights_chunk, v_for_attn)
             output_chunks.append(value_chunk)
-        
+
         value = torch.cat(output_chunks, dim=2)
         
         # diagnose code
@@ -424,14 +419,14 @@ class TorchDevice:
         return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
     def mha_gen(self, inputs, w_ln, w_q, w_k, w_v, w_out, config,
-                k_cache, v_cache, donate, compress_cache, comp_config):
+                k_cache, v_cache, donate, compress_cache, comp_config, cache_pos: int):
         """
         Multi-Head Attention for decoding stage.
         """
         # 0. Store a reference to the input tensor for the residual connection.
         residual_connection = inputs.data
 
-        b, s, h = inputs.shape # s is 1
+        b, s, h = inputs.shape # Decoding step should have seq len(s) 1.
         head_dim = h // config.num_attention_heads
         
         # 1. RMS Normalization
@@ -451,32 +446,19 @@ class TorchDevice:
         # k_cache shape is [b, num_kv_h, seq_len, h_dim].
         target_device = inputs.device.dev
         past_key_values_length = k_cache.shape[2] 
-        current_seq_len = past_key_values_length + s # s is 1
         
-        #cos, sin = self.rotary_emb(v, seq_len=past_key_values_length + s)
-        #position_ids = torch.arange(past_key_values_length, past_key_values_length + s,
-        #                            dtype=torch.long, device=inputs.device.dev).unsqueeze(0)
-
-        #q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
- 
-        # Calculate sin/cos frequencies directly.
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=target_device, dtype=torch.float32) / head_dim))
-        t = torch.arange(past_key_values_length, current_seq_len, device=target_device, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-
-        cos = emb.cos().to(q.dtype)
-        sin = emb.sin().to(q.dtype)
-        
-        # Apply the computed sin/cos to Q and K.
-        position_ids = torch.arange(s, device=target_device).unsqueeze(0)
+        cos, sin = self.rotary_emb(v, seq_len=past_key_values_length + 1)
+        position_ids = torch.full((b, s), past_key_values_length, dtype=torch.long, device=target_device)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         # 5. Concatenate current K, V to past cache
+        
         k_cache_updated = torch.cat([k_cache.data, k], dim=2)
         v_cache_updated = torch.cat([v_cache.data, v], dim=2)
         
+
         # 6. Apply GQA
+        
         n_rep = config.num_attention_heads // config.num_key_value_heads
         k_for_attn = self.repeat_kv(k_cache_updated, n_rep)
         v_for_attn = self.repeat_kv(v_cache_updated, n_rep)
@@ -484,8 +466,13 @@ class TorchDevice:
         # 7. Attention Score Calculation and Value
         
         attn_weights = torch.matmul(q, k_for_attn.transpose(2, 3)) / np.sqrt(head_dim)
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_weights = F.softmax(attn_weights, dim=-1)
         value = torch.matmul(attn_weights, v_for_attn)
+        
+        if torch.isnan(value).any() or torch.isinf(value).any():
+            print("!!! NaN/Inf in decode value !!!")
+        if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
+            print("!!! NaN/Inf in decode attn !!!")
 
         # 8. Output Projection and Residual Connection
         value = value.transpose(1, 2).contiguous().view(b, s, h)
