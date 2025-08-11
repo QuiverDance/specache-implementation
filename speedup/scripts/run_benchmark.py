@@ -1,0 +1,368 @@
+import argparse
+import json
+import os
+import numpy as np
+import torch
+from datasets import load_dataset
+from tqdm import tqdm
+from transformers import AutoTokenizer
+import re
+import string
+import time
+from collections import Counter
+
+import sys
+#~/specache-project/speedup/scripts/run_benchmark.py
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+SRC_PATH = os.path.join(PROJECT_ROOT, 'speedup', 'src')
+sys.path.insert(0, SRC_PATH)
+
+
+from flexgen.mistral_config import get_mistral_config
+from flexgen.flex_mistral import MistralLM, Policy
+from flexgen.compression import CompressionConfig
+from flexgen.utils import ExecutionEnv
+from flexgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
+
+def _bow(text: str):
+    toks = re.findall(r"[A-Za-z0-9]+", text.lower())
+    return Counter(toks)
+
+def _score_bow(q_bow, p_bow) -> float:
+    inter = sum(min(q_bow[t], p_bow.get(t, 0)) for t in q_bow)
+    denom = sum(q_bow.values()) + sum(p_bow.values()) - inter + 1e-6
+    return inter / denom
+
+def select_top_context_chunks(question: str, paragraphs, tokenizer, topk=12, max_tokens=6000):
+    q_bow = _bow(question)
+    cand = []
+    for p in paragraphs:
+        if not p:
+            continue
+        cand.append((_score_bow(q_bow, _bow(p)), p))
+    cand.sort(key=lambda x: x[0], reverse=True)
+
+    selected, used = [], 0
+    for _, p in cand[: topk * 4]:
+        n_tok = len(tokenizer.encode(p))
+        if used + n_tok > max_tokens:
+            continue
+        selected.append(p)
+        used += n_tok
+        if len(selected) >= topk:
+            break
+    return "\n\n".join(selected) if selected else (paragraphs[0] if paragraphs else "")
+
+def build_qasper_prompt(item, tokenizer, max_length):
+    
+    question = item['input']
+    context = item['context']
+
+    # Split raw context into paragraphs
+    if isinstance(context, list):
+        paragraphs = [p for p in context if isinstance(p, str)]
+    else:
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", context) if p.strip()]
+
+    # Question-centric selection (limit prompt length pressure)
+    reduced_context = select_top_context_chunks(
+        question=question,
+        paragraphs=paragraphs,
+        tokenizer=tokenizer,
+        topk=12,
+        max_tokens=min(max_length, 6000),
+    )
+
+    # Strong instruction for short, list-like answers
+    user_content = (
+        "You answer questions about a paper. "
+        "Reply with a short phrase only. If multiple items, separate with commas. "
+        "Do not repeat the question. No explanation.\n\n"
+        f"Context:\n{reduced_context}\n\nQuestion:\n{question}\n\nAnswer:"
+    )
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": user_content}],
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    return prompt 
+
+def normalize_answer(s):
+    def remove_articles(text):
+        return re.sub(r"\b(a|an|the)\b", " ", text)
+    def white_space_fix(text):
+        return " ".join(text.split())
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return "".join(ch for ch in text if ch not in exclude)
+    def lower(text):
+        return text.lower()
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+def postprocess_qasper_answer(pred):
+    text = pred.strip()
+    if text.lower().startswith("answer:"):
+        text = text[len("answer:"):].strip()
+
+    para_end = text.find("\n\n")
+    if para_end != -1:
+        text = text[:para_end].strip()
+    
+    # cut at common prompt artifacts if they leaked
+    for stop in ["\nQuestion:", "\nContext:", "Question:", "Context:"]:
+        if stop in text:
+            text = text.split(stop)[0].strip()
+
+    # keep it short (first sentence-ish)
+    for sep in [". ", "; ", "\n"]:
+        if sep in text:
+            text = text.split(sep)[0].strip()
+            break
+
+    # yes/no normalization (helps surface-form match)
+    tlow = text.lower()
+    if tlow in {"yes","yeah","yep","true","correct"}:
+        return "yes"
+    if tlow in {"no","nope","false","incorrect"}:
+        return "no"
+
+    return text
+
+def f1_score(prediction, ground_truth):
+    prediction_tokens = normalize_answer(prediction).split()
+    ground_truth_tokens = normalize_answer(ground_truth).split()
+    
+    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0
+    precision = 1.0 * num_same / len(prediction_tokens) if len(prediction_tokens) > 0 else 0
+    recall = 1.0 * num_same / len(ground_truth_tokens) if len(ground_truth_tokens) > 0 else 0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    return f1
+
+def evaluate_qasper(predictions, references):
+    f1 = 0.0
+    for pred, ref_list in zip(predictions, references):
+        f1 += max([f1_score(pred, ref) for ref in ref_list])
+    return {"f1_score": f1 / len(predictions)}
+
+TASK_MAPPING = {
+    "qasper": {
+      "prompt_builder": build_qasper_prompt,
+      "postprocessor": postprocess_qasper_answer,
+      "evaluator": evaluate_qasper,
+      "ref_key": "answers"
+    }
+    #add another benchmark test.
+}
+
+def to_str_list(x):
+    if isinstance(x, str):
+        return [x]
+    if isinstance(x, list):
+        if len(x) > 0 and isinstance(x[0], dict):
+            return [d.get('text', str(d)) for d in x]
+        return [str(e) for e in x]
+    if isinstance(x, dict):
+        for k in ('text', 'answer', 'answers'):
+            if k in x and isinstance(x[k], str):
+                return [x[k]]
+            if k in x and isinstance(x[k], list):
+                return [str(e) for e in x[k]]
+        return [str(x)]
+    return [str(x)]
+
+
+def slice_generation(output_ids, prompt_len):
+    if output_ids.shape[1] <= prompt_len:
+        return output_ids[:, 0:0]
+    return output_ids[:, prompt_len:]
+
+def postprocess_and_count_tokens(predictions_ids, prompts_ids, tokenizer):
+    """
+    Decode generated ID and Cut based on EOS tokens.
+    It also counts the number of valid tokens actually generated.
+    """
+    # To find the EOS location by decoding it, including the special token.
+    decoded_texts = tokenizer.batch_decode(predictions_ids, skip_special_tokens=False)
+
+    actual_generated_tokens = 0
+    processed_texts = []
+
+    eos_token = tokenizer.eos_token
+    #pad_token_id = tokenizer.pad_token_id
+
+    for i, text in enumerate(decoded_texts):
+        # If you have EOS tokens, only use the content up to that point
+        if eos_token in text:
+            text = text.split(eos_token)[0]
+
+        # Calculating the number of valid tokens: excluding padding after EOS
+        pred_ids_single = predictions_ids[i]
+        eos_locs = np.where(pred_ids_single == tokenizer.eos_token_id)
+
+        #valid_token_indices = np.where(pred_ids_single == tokenizer.eos_token_id)
+
+        if len(eos_locs[0]) > 0:
+            #first_eos_index = valid_token_indices[0][0]
+            first_eos_index = int(eos_locs[0][0])
+            actual_generated_tokens += first_eos_index
+        else:
+            # If there is no EOS, count the entire token, not the padding.
+            #actual_generated_tokens += np.sum(pred_ids_single != pad_token_id)
+            actual_generated_tokens += pred_ids_single.shape[0] 
+
+        #processed_texts.append(text)
+        processed_texts.append(text.strip())
+
+    return processed_texts, actual_generated_tokens
+
+def run_benchmark(config):
+    
+    model_args = config['model_args']
+    policy_args = config['policy_args']
+    benchmark_args = config['benchmark_args']
+
+    task_name = benchmark_args['task_name']
+    if task_name not in TASK_MAPPING:
+        raise ValueError(f"Task '{task_name}' is not supported.")
+
+    task_handler = TASK_MAPPING[task_name]
+
+    print("Initializing model and environment...")
+    tokenizer = AutoTokenizer.from_pretrained(model_args['model'], padding_side="left")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    mistral_config = get_mistral_config(model_args['model'])
+    max_input_len = mistral_config.max_position_embeddings - benchmark_args['max_new_tokens']
+
+    gpu = TorchDevice("cuda:0", config=mistral_config)
+    cpu = TorchDevice("cpu", config=mistral_config)
+    disk = TorchDisk(model_args['offload_dir'])
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+   
+    policy = Policy(
+        gpu_batch_size=policy_args['gpu_batch_size'],
+        num_gpu_batches=policy_args['num_gpu_batches'],
+        w_gpu_percent=policy_args['percent'][0], w_cpu_percent=policy_args['percent'][1],
+        cache_gpu_percent=policy_args['percent'][2], cache_cpu_percent=policy_args['percent'][3],
+        act_gpu_percent=policy_args['percent'][4], act_cpu_percent=policy_args['percent'][5],
+        overlap=False, pin_weight=policy_args['pin_weight'], cpu_cache_compute=False,
+        compress_weight=False, comp_weight_config=None,
+        compress_cache=False, comp_cache_config=None
+    )
+
+    model=MistralLM(mistral_config, env, model_args['path'], policy, model_id=model_args['model'])
+    print("Model initialized.")
+
+    print(f"Loading dataset for {task_name}...")
+    dataset = load_dataset("THUDM/LongBench", task_name, split="test")
+
+    #PRACTICAL_MAX_LEN = 2048
+    #max_input_len = min(mistral_config.max_position_embeddings - benchmark_args['max_new_tokens'], PRACTICAL_MAX_LEN)
+    
+    predictions = []
+    references = []
+
+    total_batch_size = policy.gpu_batch_size * policy.num_gpu_batches
+    total_duration_sec = 0.0
+    total_prompt_tokens = 0
+    total_generated_tokens = 0
+
+    for i in tqdm(range(0, len(dataset), total_batch_size), desc="Running benchmark..."):
+        batch_slice = dataset[i : i + total_batch_size]
+        if len(batch_slice['input']) < total_batch_size:
+            continue
+
+        batch_prompts = []
+        for j in range(total_batch_size):
+            item = {key: batch_slice[key][j] for key in batch_slice.keys()}
+            prompt = task_handler['prompt_builder'](item, tokenizer, max_input_len)
+            batch_prompts.append(prompt)
+
+        tokenized_inputs = tokenizer(
+            batch_prompts, 
+            return_tensors="np", 
+            padding=True,
+            truncation=True,
+            max_length=max_input_len
+        )
+        inputs_np = tokenized_inputs['input_ids']
+        attention_mask = tokenized_inputs['attention_mask']
+
+        print(f'Input shape for batch {i//total_batch_size + 1}: {inputs_np.shape}')
+        start_time = time.time()
+
+        output_ids = model.generate(
+            inputs={'input_ids': inputs_np, 'attention_mask': attention_mask},
+            max_new_tokens=benchmark_args['max_new_tokens'],
+            do_sample=False,
+            temperature=0.0
+        )
+
+        end_time = time.time()
+        total_duration_sec += (end_time - start_time)
+
+        prompt_len = inputs_np.shape[1]
+
+        #gen_ids = slice_generation(output_ids, prompt_len)
+        gen_ids = output_ids[:, prompt_len:]
+
+        #output_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=False)
+        output_texts, generated_tokens_in_batch = postprocess_and_count_tokens(
+            gen_ids, inputs_np, tokenizer
+        )
+        total_generated_tokens += generated_tokens_in_batch
+        
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        #for metrics 
+        prompt_tokens_in_batch = np.sum(attention_mask)
+        total_prompt_tokens += prompt_tokens_in_batch
+
+        for idx, text in enumerate(output_texts):
+            prediction = task_handler['postprocessor'](text)
+            predictions.append(prediction)
+
+            raw_ref = batch_slice[task_handler['ref_key']][idx]
+            references.append(to_str_list(raw_ref))
+        print("DEBUG answer example :", references[-1])
+        print("DEBUG pred example :", predictions[-1][:140])
+
+    print("Evaluating results...")
+    metrics = task_handler['evaluator'](predictions, references)
+
+    total_tokens = total_prompt_tokens + total_generated_tokens
+    overall_throughput = total_tokens / total_duration_sec if total_duration_sec > 0 else 0
+    generation_throughput = total_generated_tokens / total_duration_sec if total_duration_sec > 0 else 0
+
+    metrics['total_duration_sec'] = round(total_duration_sec, 2)
+    metrics['total_prompt_tokens'] = int(total_prompt_tokens)
+    metrics['total_generated_tokens'] = int(total_generated_tokens)
+    metrics['overall_throughput_tokens_per_sec'] = round(overall_throughput, 2)
+    metrics['generation_throughput_tokens_per_sec'] = round(generation_throughput, 2)
+
+    print(f"\n---Result for {task_name}---")
+    print(json.dumps(metrics,indent=2))
+
+    os.makedirs(os.path.dirname(benchmark_args['output_file']), exist_ok=True)
+    with open(benchmark_args['output_file'], 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Results saved to {benchmark_args['output_file']}")
+
+    env.close_copy_threads()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="Path to the benchmark config JSON file.")
+    args = parser.parse_args()
+
+    with open(args.config, 'r') as f:
+        config = json.load(f)
+
+    run_benchmark(config)

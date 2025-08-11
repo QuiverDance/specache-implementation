@@ -1,0 +1,8 @@
+{
+  "f1_score": 0.14679265705700134,
+  "total_duration_sec": 8949.34,
+  "total_prompt_tokens": 1116676,
+  "total_generated_tokens": 17397,
+  "overall_throughput_tokens_per_sec": 126.72,
+  "generation_throughput_tokens_per_sec": 1.94
+}

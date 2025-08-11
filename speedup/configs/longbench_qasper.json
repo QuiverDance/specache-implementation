@@ -1,0 +1,21 @@
+{
+  "model_args":{
+    "model": "mistralai/Mistral-7B-Instruct-v0.2",
+    "path":"~/flexgen_weights/mistralai/Mistral-7B-Instruct-v0.2-np",
+    "offload_dir": "~/flexgen_offload_dir"
+  },
+  "policy_args":{
+    "gpu_batch_size": 1,
+    "num_gpu_batches": 1,
+    "percent":[100, 0, 0, 100, 0, 100],
+    "pin_weight": true,
+    "cpu_cache_compute": false,
+    "compress_weigth" : false,
+    "compress_cache" : false
+  },
+  "benchmark_args":{
+    "task_name": "qasper",
+    "max_new_tokens": 128,
+    "output_file": "results/qasper_baseline_result.json"
+  }
+}
