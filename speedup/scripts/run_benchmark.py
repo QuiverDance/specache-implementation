@@ -25,15 +25,61 @@ from flexgen.compression import CompressionConfig
 from flexgen.utils import ExecutionEnv
 from flexgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
 
+def _bow(text: str):
+    toks = re.findall(r"[A-Za-z0-9]+", text.lower())
+    return Counter(toks)
+
+def _score_bow(q_bow, p_bow) -> float:
+    inter = sum(min(q_bow[t], p_bow.get(t, 0)) for t in q_bow)
+    denom = sum(q_bow.values()) + sum(p_bow.values()) - inter + 1e-6
+    return inter / denom
+
+def select_top_context_chunks(question: str, paragraphs, tokenizer, topk=12, max_tokens=6000):
+    q_bow = _bow(question)
+    cand = []
+    for p in paragraphs:
+        if not p:
+            continue
+        cand.append((_score_bow(q_bow, _bow(p)), p))
+    cand.sort(key=lambda x: x[0], reverse=True)
+
+    selected, used = [], 0
+    for _, p in cand[: topk * 4]:
+        n_tok = len(tokenizer.encode(p))
+        if used + n_tok > max_tokens:
+            continue
+        selected.append(p)
+        used += n_tok
+        if len(selected) >= topk:
+            break
+    return "\n\n".join(selected) if selected else (paragraphs[0] if paragraphs else "")
+
 def build_qasper_prompt(item, tokenizer, max_length):
     
     question = item['input']
     context = item['context']
 
+    # Split raw context into paragraphs
+    if isinstance(context, list):
+        paragraphs = [p for p in context if isinstance(p, str)]
+    else:
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", context) if p.strip()]
+
+    # Question-centric selection (limit prompt length pressure)
+    reduced_context = select_top_context_chunks(
+        question=question,
+        paragraphs=paragraphs,
+        tokenizer=tokenizer,
+        topk=12,
+        max_tokens=min(max_length, 6000),
+    )
+
+    # Strong instruction for short, list-like answers
     user_content = (
-        "You are a helpful research assistant.\n\n"
-        "Read the following context and answer the question concisely.\n\n"
-        f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+        "You answer questions about a paper. "
+        "Reply with a short phrase only. If multiple items, separate with commas. "
+        "Do not repeat the question. No explanation.\n\n"
+        f"Context:\n{reduced_context}\n\nQuestion:\n{question}\n\nAnswer:"
     )
 
     prompt = tokenizer.apply_chat_template(
@@ -63,6 +109,25 @@ def postprocess_qasper_answer(pred):
     para_end = text.find("\n\n")
     if para_end != -1:
         text = text[:para_end].strip()
+    
+    # cut at common prompt artifacts if they leaked
+    for stop in ["\nQuestion:", "\nContext:", "Question:", "Context:"]:
+        if stop in text:
+            text = text.split(stop)[0].strip()
+
+    # keep it short (first sentence-ish)
+    for sep in [". ", "; ", "\n"]:
+        if sep in text:
+            text = text.split(sep)[0].strip()
+            break
+
+    # yes/no normalization (helps surface-form match)
+    tlow = text.lower()
+    if tlow in {"yes","yeah","yep","true","correct"}:
+        return "yes"
+    if tlow in {"no","nope","false","incorrect"}:
+        return "no"
+
     return text
 
 def f1_score(prediction, ground_truth):
@@ -128,7 +193,7 @@ def postprocess_and_count_tokens(predictions_ids, prompts_ids, tokenizer):
     processed_texts = []
 
     eos_token = tokenizer.eos_token
-    pad_token_id = tokenizer.pad_token_id
+    #pad_token_id = tokenizer.pad_token_id
 
     for i, text in enumerate(decoded_texts):
         # If you have EOS tokens, only use the content up to that point
@@ -137,16 +202,21 @@ def postprocess_and_count_tokens(predictions_ids, prompts_ids, tokenizer):
 
         # Calculating the number of valid tokens: excluding padding after EOS
         pred_ids_single = predictions_ids[i]
-        valid_token_indices = np.where(pred_ids_single == tokenizer.eos_token_id)
+        eos_locs = np.where(pred_ids_single == tokenizer.eos_token_id)
 
-        if len(valid_token_indices[0]) > 0:
-            first_eos_index = valid_token_indices[0][0]
+        #valid_token_indices = np.where(pred_ids_single == tokenizer.eos_token_id)
+
+        if len(eos_locs[0]) > 0:
+            #first_eos_index = valid_token_indices[0][0]
+            first_eos_index = int(eos_locs[0][0])
             actual_generated_tokens += first_eos_index
         else:
             # If there is no EOS, count the entire token, not the padding.
-            actual_generated_tokens += np.sum(pred_ids_single != pad_token_id)
+            #actual_generated_tokens += np.sum(pred_ids_single != pad_token_id)
+            actual_generated_tokens += pred_ids_single.shape[0] 
 
-        processed_texts.append(text)
+        #processed_texts.append(text)
+        processed_texts.append(text.strip())
 
     return processed_texts, actual_generated_tokens
 
@@ -230,9 +300,8 @@ def run_benchmark(config):
         output_ids = model.generate(
             inputs={'input_ids': inputs_np, 'attention_mask': attention_mask},
             max_new_tokens=benchmark_args['max_new_tokens'],
-            #min_new_tokens=1,
-            #do_sample=True,
-            #temperature=0.7
+            do_sample=False,
+            temperature=0.0
         )
 
         end_time = time.time()
